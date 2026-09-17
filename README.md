@@ -105,6 +105,43 @@ its own. `--contrast` puts the *current* caption in the softmax bank, which make
 "raise the target at the expense of the current" rather than "raise the target" — the push rather
 than a drift, with no new loss function.
 
+### Pre-diffusion masking (arms 1 and 2)
+
+FILIP is a **late-interaction** model: `filip_score_matrix` forms a per-(residue, text-token)
+similarity matrix and then averages it twice. Those averages are a badly attenuated readout — the
+t→p half divides by ~280 text tokens, so rewriting a whole caption field moves the total by a couple
+of percent, and the p→t half can move the *other* way at the same time because a residue whose best
+token was deleted simply finds the next best one. Measured: an unrelated caption moves the score
+**0.28**, a minimally edited one **0.006**.
+
+Read the matrix locally instead — only the columns of the tokens a swap *deletes* — and the same
+model turns out to know exactly where its caption's claims live. On the Sho1 homolog E7QE10,
+fraction of the top-20 aligned residues inside the annotated region:
+
+| tokens | region | in-region | chance |
+|---|---|---|---|
+| `multi` `-` `pass` | TM helices | **100%** | 32% |
+| `membrane` | TM helices | **75%** | 32% |
+| `sh3 domain` (FAMILY NAMES) | SH3 domain | **90%** | 17% |
+| `sh3 domain` (SUBUNIT) | SH3 domain | **95%** | 17% |
+
+So `--select filip` masks the residues the deleted phrase points at, before any decoding, and lets
+the model refill them. No backward pass — cheaper than the gradient selector it replaces.
+
+```
+a1   --select filip  --gamma 0   --rounds 1     aligned mask, unguided
+a2   --select filip  --gamma G   --rounds 1     aligned mask, guided
+a4   --select random --gamma 0   --rounds 1     the floor: same count, no information
+tag  --select tag    --gamma G   --rounds R     the original iterative gradient selector
+```
+
+**a1 vs a4** says whether localisation bought anything. **a2 vs a1** is the only place guidance has
+to justify itself — and four of the six swaps are *removals*, which a prior may well do unaided.
+
+The `hit` column reports what fraction of the residues actually unfrozen fell inside the annotated
+region, against chance. That is the arm's own premise: if `hit` sits at chance, nothing downstream
+is worth reading.
+
 ### Two gates, and they come first
 
 **V — captions round-trip** (`src.captions verify`). A swapped target is text nobody has encoded,

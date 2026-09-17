@@ -49,6 +49,16 @@ cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
 source ./scripts/pbs_common.sh
 
 PHASES=${PHASES:-VSER}
+# The arms. Each is a different answer to "which residues get unfrozen, and is the refill steered".
+#   a1  pre-diffusion masking, UNGUIDED. Mask the residues the deleted caption phrase points at and
+#       let the model refill them from its prior. Four of the six swaps are REMOVALS, and removing
+#       a rare feature is something the prior does on its own -- so this arm may be sufficient, and
+#       if it is, guidance was never the mechanism.
+#   a2  the same positions, guided. The only place guidance has to justify itself.
+#   a4  random positions, same count. The floor: if a1 does not beat this, localisation bought
+#       nothing.
+#   tag the original iterative gradient selector, kept for comparison.
+ARMS=${ARMS:-a1:a2:a4}
 N=${N:-4}                     # replicates per swap, batched in one canvas
 ROUNDS=${ROUNDS:-12}
 K=${K:-8}                     # positions edited per round
@@ -62,6 +72,9 @@ GUIDE_CHUNK=${GUIDE_CHUNK:-4}
 GUIDE_MODE=${GUIDE_MODE:-tag}
 CONTRAST=${CONTRAST:-1}       # 0 -> pull toward the target only, with nothing to push away from
 KINDS=${KINDS:-swap:control_null:control_decoy}
+SELECT=${SELECT:-filip}
+ALIGN_SIDE=${ALIGN_SIDE:-removed}
+DILATE=${DILATE:-2}
 SEED=${SEED:-0}
 
 RUNS=$(python -c "from config import RUNS_DIR; print(RUNS_DIR)")
@@ -81,10 +94,21 @@ phase() { local n="$1" t0="$2"; PHASE_T[$n]=$(( SECONDS - t0 )); \
 CKPT_FLAG=""; [ -n "${CKPT:-}" ] && CKPT_FLAG="--ckpt ${CKPT}"
 ONLY_FLAG=""; [ -n "${ONLY:-}" ] && ONLY_FLAG="--only ${ONLY}"
 CONTRAST_FLAG="--contrast"; [ "${CONTRAST}" = "0" ] && CONTRAST_FLAG="--no-contrast"
-COMMON=( --device xpu --n "${N}" --k "${K}" --gamma "${GAMMA}"
+COMMON=( --device xpu --n "${N}" --k "${K}"
          --max-edit-frac "${MAX_EDIT_FRAC}" --stop-frac "${STOP_FRAC}"
          --temperature "${TEMP}" --guide-chunk "${GUIDE_CHUNK}" --guide-mode "${GUIDE_MODE}"
+         --align-side "${ALIGN_SIDE}" --dilate "${DILATE}"
          --kinds "${KINDS}" --seed "${SEED}" )
+
+arm_flags() {
+    case "$1" in
+        a1)  echo "--select filip  --gamma 0        --rounds 1" ;;
+        a2)  echo "--select filip  --gamma ${GAMMA} --rounds 1" ;;
+        a4)  echo "--select random --gamma 0        --rounds 1" ;;
+        tag) echo "--select tag    --gamma ${GAMMA} --rounds ${ROUNDS}" ;;
+        *)   echo "--select ${SELECT} --gamma ${GAMMA} --rounds ${ROUNDS}" ;;
+    esac
+}
 rc=0
 
 # --- the swap definitions (cheap; rebuilt if absent, always re-validated) ----------------------
@@ -115,7 +139,7 @@ if has S; then
     echo "[edit] phase S: scoring the untouched proteins against every caption (--rounds 0)"
     rm -f "${SEPAR%.jsonl}"*.jsonl
     # shellcheck disable=SC2086
-    "${MPI_LAUNCH[@]}" python -m src.edit "${COMMON[@]}" --rounds 0 --out "${SEPAR}" \
+    "${MPI_LAUNCH[@]}" python -m src.edit "${COMMON[@]}" --rounds 0 --gamma 0 --out "${SEPAR}" \
         ${CKPT_FLAG} ${ONLY_FLAG} ${CONTRAST_FLAG} ${EDIT_ARGS:-}
     src=$?
     phase "S-separability" $t0
@@ -139,21 +163,35 @@ fi
 
 # --- E: the edit loop ---------------------------------------------------------------------------
 if has E; then
-    t0=$SECONDS
-    echo "[edit] phase E: ${ROUNDS} rounds x ${K} positions, budget ${MAX_EDIT_FRAC}, on ${NRANKS} tile(s)"
-    # Resumable: each rank appends to its own JSONL and skips swap ids already in it, so a fault
-    # costs the record in flight rather than the run.
-    # shellcheck disable=SC2086
-    "${MPI_LAUNCH[@]}" python -m src.edit "${COMMON[@]}" --rounds "${ROUNDS}" --out "${EDITS}" \
-        ${CKPT_FLAG} ${ONLY_FLAG} ${CONTRAST_FLAG} ${EDIT_ARGS:-}
-    rc=$?
-    phase "E-edit" $t0
+    IFS=':' read -ra ARM_LIST <<< "${ARMS}"
+    for arm in "${ARM_LIST[@]}"; do
+        t0=$SECONDS
+        OUT="${OUT_DIR}/edits_${arm}.jsonl"
+        echo "[edit] phase E arm '${arm}': $(arm_flags "$arm"), budget ${MAX_EDIT_FRAC}, ${NRANKS} tile(s)"
+        # Resumable: each rank appends to its own JSONL and skips swap ids already in it, so a
+        # fault costs the record in flight rather than the arm.
+        # shellcheck disable=SC2086
+        "${MPI_LAUNCH[@]}" python -m src.edit "${COMMON[@]}" --out "${OUT}" \
+            $(arm_flags "$arm") ${CKPT_FLAG} ${ONLY_FLAG} ${CONTRAST_FLAG} ${EDIT_ARGS:-}
+        arc=$?
+        [ $arc -ne 0 ] && { echo "[edit] arm '${arm}' exited ${arc}" >&2; rc=$arc; }
+        phase "E-${arm}" $t0
+    done
 fi
 
 # --- R: the table -------------------------------------------------------------------------------
 if has R; then
-    echo "[edit] phase R:"
-    python -m src.edit --summarize "${EDITS%.jsonl}"*.jsonl || rc=$?
+    IFS=':' read -ra ARM_LIST <<< "${ARMS}"
+    for arm in "${ARM_LIST[@]}"; do
+        echo ""
+        echo "############## arm ${arm}: $(arm_flags "$arm") ##############"
+        python -m src.edit --summarize "${OUT_DIR}/edits_${arm}"*.jsonl || true
+    done
+    echo ""
+    echo "[edit] COMPARE THE ARMS, not the rows. a1 vs a4 says whether aligning the mask to the"
+    echo "[edit] deleted phrase bought anything over masking the same number of residues at random."
+    echo "[edit] a2 vs a1 is the only place guidance has to justify itself -- and four of the six"
+    echo "[edit] swaps are REMOVALS, which the prior may well do unaided."
     echo ""
     echo "[edit] The edited sequences are in ${EDITS}. NOTHING HERE IS EVIDENCE ON ITS OWN:"
     echo "[edit] the score being reported is the score being optimised. What settles a row is its"

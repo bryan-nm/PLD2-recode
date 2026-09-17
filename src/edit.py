@@ -51,6 +51,7 @@ from config import CFG, CKPT_DIR, FILIP_CACHE, FILIP_CKPT
 from .data import AA, DI
 from .dist import init_distributed
 from .model import LoopedDiffusionLM
+from .align_positions import changed_token_indices, positions_for_tokens
 from .sampler import aa_track, decode_seqs, decode_struct, generate
 from .swaps import read as read_swaps
 from .train import find_latest_ckpt
@@ -127,6 +128,44 @@ def pick_positions(gain, k, editable):
     return (rank < k) & editable
 
 
+def _overlap(picked_lists, region, L):
+    """Fraction of each replicate's selected residues inside the annotated region, and the fraction
+    a same-sized random selection would land there. THE VALIDATION NUMBER: on Sho1 the aligned
+    positions beat chance 3x for the transmembrane helices and 5x for the SH3 domain, and if a run
+    does not reproduce that the selector is not doing what the whole arm assumes."""
+    if not region or not any(picked_lists):
+        return None
+    lo, hi = region
+    frac = [sum(lo <= p < hi for p in row) / max(len(row), 1) for row in picked_lists if row]
+    return {"inside": frac, "chance": (hi - lo) / max(L, 1)}
+
+
+def select_positions(mode, cv, guide, z_cur, m_cur, removed_tok, k, editable, dilate, seed):
+    """(B,L) bool: which residues to unfreeze this round.
+
+    filip   the positions most aligned with the text tokens the swap DELETES. Read straight off
+            FILIP's late-interaction matrix, which already knows where a caption's claims live:
+            measured on Sho1, "multi/-/pass" puts 100% of its top-20 inside the transmembrane
+            helices and "sh3 domain" 90-95% inside the SH3 domain, against chance of 32% and 17%.
+            No backward pass -- cheaper than the gradient it replaces.
+    tag     the original selector: where the target caption's log-probability is most improvable.
+            Only well-posed if the classifier can score the distinction, and on these swaps its
+            aggregate barely moves, which is what motivated the change.
+    random  the floor. Same count, no information.
+    """
+    if mode == "random":
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        r = torch.rand(editable.shape, generator=g).to(editable.device)
+        return pick_positions(r, k, editable)
+    if mode == "tag":
+        delta = guide.tag_delta(aa_track(cv))
+        cur = aa_track(cv).clamp(max=19).unsqueeze(-1)
+        gain = delta.max(-1).values - delta.gather(-1, cur).squeeze(-1)
+        return pick_positions(gain, k, editable)
+    sim = guide.align_to_text(aa_track(cv), z_cur, m_cur)
+    return positions_for_tokens(sim, removed_tok, k, dilate=dilate, editable=editable)
+
+
 def run_swap(rec, model, guide, capenc, bank_z, bank_mask, bank_names, mcfg, dcfg, dev, a):
     """-> a trajectory dict for one swap record."""
     t0 = time.perf_counter()
@@ -157,9 +196,16 @@ def run_swap(rec, model, guide, capenc, bank_z, bank_mask, bank_names, mcfg, dcf
     # stop_frac mean "close this fraction of the separability gap" for either sign, and 1.0 still
     # reproduces exactly the rule this experiment is defined by: edit until the protein matches the
     # target caption as well as it originally matched its own.
-    s_cur0, s_tgt0 = float(s0[:, i_cur].mean()), float(s0[:, i_tgt].mean())
-    sep = s_cur0 - s_tgt0
-    stop_at = s_tgt0 + a.stop_frac * sep
+    # PER REPLICATE, NOT A BATCH MEAN. The first version compared each replicate's score against
+    # the mean over the batch, so any replicate a hair below the mean stayed active -- which is why
+    # null controls, whose gap is exactly zero and which must never edit, came back having edited
+    # 6-10 positions over as many as 12 rounds. The floor everything else is read against was
+    # drifting.
+    s_cur0_v, s_tgt0_v = s0[:, i_cur], s0[:, i_tgt]
+    sep_v = s_cur0_v - s_tgt0_v
+    stop_at_v = s_tgt0_v + a.stop_frac * sep_v                      # [B]
+    s_cur0, s_tgt0 = float(s_cur0_v.mean()), float(s_tgt0_v.mean())
+    sep, stop_at = s_cur0 - s_tgt0, float(stop_at_v.mean())
 
     if sep <= 0 and rec["kind"] == "swap":
         # NOT A FAILURE, AND THE MOST IMPORTANT THING THIS RUN CAN SAY. The stopping rule is "reach
@@ -173,7 +219,23 @@ def run_swap(rec, model, guide, capenc, bank_z, bank_mask, bank_names, mcfg, dcf
               f"no gap to close and no edit to make. This row is uninformative by construction.",
               flush=True)
 
+    # THE TOKENS THE SWAP DELETES, in the current caption's own token coordinates -- the columns of
+    # the alignment matrix that point at the residues implementing what we want gone.
+    removed_tok, added_tok = changed_token_indices(
+        getattr(capenc, "tok", None), rec["caption_current"], rec["caption_target"],
+        getattr(capenc, "max_len", None)) if rec["caption_current"] != rec["caption_target"] \
+        else ([], [])
+    if a.align_side == "added":
+        removed_tok = added_tok
+    elif a.align_side == "both":
+        removed_tok = sorted(set(removed_tok) | set(added_tok))
+
     budget = max(1, int(round(a.max_edit_frac * L)))
+    # PRE-DIFFUSION MASKING: with one round the whole budget is unfrozen at once, before any
+    # decoding, from the alignment computed on the UNTOUCHED protein. That is the intervention --
+    # take out the residues the deleted phrase points at and let the model refill them -- and it is
+    # a different thing from nudging k residues per round toward a gradient.
+    k_round = budget if (a.select == "filip" and a.rounds == 1) else a.k
     pos = torch.arange(dcfg.canvas, device=dev)
     is_res = (pos < L).unsqueeze(0).expand(B, -1)
     ever = torch.zeros(B, dcfg.canvas, dtype=torch.bool, device=dev)
@@ -183,17 +245,15 @@ def run_swap(rec, model, guide, capenc, bank_z, bank_mask, bank_names, mcfg, dcf
 
     for rnd in range(1, a.rounds + 1):
         s = scores(cv)
-        active &= (s[:, i_tgt] < stop_at) & (ever.sum(1) < budget)
+        active &= (s[:, i_tgt] < stop_at_v) & (ever.sum(1) < budget)
         if not bool(active.any()):
             break
-        delta = guide.tag_delta(aa_track(cv))                                # [B, L, 20]
-        cur = aa_track(cv).clamp(max=19).unsqueeze(-1)
-        gain = delta.max(-1).values - delta.gather(-1, cur).squeeze(-1)      # [B, L]
         # Once the budget is spent a row may only refine what it has already touched, so an edit
         # cannot quietly spread across the whole protein one round at a time.
         spent = ever.sum(1, keepdim=True) >= budget
         editable = is_res & active.unsqueeze(1) & torch.where(spent, ever, is_res)
-        picked = pick_positions(gain, a.k, editable)
+        picked = select_positions(a.select, cv, guide, z_cur, m_cur, removed_tok,
+                                  k_round, editable, a.dilate, a.seed + rnd)
         if not bool(picked.any()):
             break
 
@@ -202,7 +262,7 @@ def run_swap(rec, model, guide, capenc, bank_z, bank_mask, bank_names, mcfg, dcf
         given[:, :, L:] = True                         # EOS and the PAD tail stay context
         torch.manual_seed(a.seed + 7919 * rnd)
         cv, _ = _decode(model, dev, Lmax=dcfg.canvas, batch_size=B,
-                        n_steps=max(2 * a.k, 8),
+                        n_steps=max(2 * int(picked.sum(1).max()), 16),
                         temperature=a.temperature, gumbel_temp=CFG.opt.sample_gumbel_temp,
                         rep_penalty=CFG.opt.sample_rep_penalty,
                         rep_periods=CFG.opt.sample_rep_periods, max_run=CFG.opt.sample_max_run,
@@ -214,6 +274,7 @@ def run_swap(rec, model, guide, capenc, bank_z, bank_mask, bank_names, mcfg, dcf
                          scores=scores(cv).float().cpu().tolist(), seqs=seqs,
                          picked=[p.nonzero().flatten().cpu().tolist() for p in picked]))
 
+    sel0 = traj[1].get("picked", [[]]) if len(traj) > 1 else [[]]
     final = decode_seqs(cv, mcfg)[0]
     dis = decode_struct(cv, mcfg)[0] if mcfg.n_tracks == 2 else [None] * B
     ident = [sum(x == y for x, y in zip(rec["sequence"], f)) / max(L, 1) for f in final]
@@ -222,6 +283,9 @@ def run_swap(rec, model, guide, capenc, bank_z, bank_mask, bank_names, mcfg, dcf
         stub=bool(getattr(a, "stub_filip", False)),
         n=B, rounds_run=len(traj) - 1, budget=budget, gamma=a.gamma, contrast=bool(a.contrast),
         separability=sep, stop_at=stop_at, bank=bank_names,
+        select=a.select, align_side=a.align_side, dilate=a.dilate,
+        n_changed_tokens=len(removed_tok), first_round_positions=sel0,
+        region=rec.get("region"), region_overlap=_overlap(sel0, rec.get("region"), L),
         s0=s0.float().cpu().tolist(), s_final=traj[-1]["scores"],
         identity_to_original=ident, n_edited=ever.sum(1).cpu().tolist(),
         original=rec["sequence"], edited=final, edited_3di=dis,
@@ -261,29 +325,53 @@ def summarize(paths):
         raise SystemExit(f"nothing to summarize in {paths}")
     if any(r.get("stub") for r in recs):
         print("!! STUBBED RUN: these scores come from src/stub_filip.py, not FILIP. !!\n")
-    print(f"{'swap':<38} {'kind':<14} {'sep':>8} {'d target':>9} {'d current':>10} "
-          f"{'spec':>8} {'edited':>9} {'ident':>7} {'rnds':>5}")
-    print("-" * 114)
+    print(f"{'swap':<36} {'kind':<14} {'sep':>8} {'d target':>9} {'spec':>8} {'spec_adj':>9} "
+          f"{'hit':>12} {'edited':>9} {'ident':>7} {'rnds':>5}")
+    print("-" * 122)
     for r in sorted(recs, key=lambda x: (x["swap_id"].split("__")[0], x["kind"])):
         names, s0, sf = r["bank"], torch.tensor(r["s0"]), torch.tensor(r["s_final"])
         base = r["swap_id"].split("__")[0]
-        i_t = names.index(base + "/target") if base + "/target" in names else None
-        i_c = names.index(base + "/current") if base + "/current" in names else None
-        if i_t is None or i_c is None:
+        if base + "/target" not in names or base + "/current" not in names:
             continue
+        i_t = names.index(base + "/target")
         d = (sf - s0).mean(0)
         others = [j for j, nm in enumerate(names)
                   if nm.endswith("/target") and not nm.startswith(base + "/")]
         spec = float(d[i_t] - (d[others].mean() if others else 0.0))
-        print(f"{r['swap_id']:<38} {r['kind']:<14} {r['separability']:>+8.4f} "
-              f"{float(d[i_t]):>+9.4f} {float(d[i_c]):>+10.4f} {spec:>+8.4f} "
+        # REGRESSION TO THE MEAN IS NOT STEERING, and raw `spec` cannot tell them apart. Damaging a
+        # protein pulls every score toward the middle: a caption that started at 0.97 falls and one
+        # that started at 0.61 RISES, with nothing steered. Measured on a decoy control, the decoy
+        # caption gained +0.108 while the true one lost -0.101 -- pure degradation reading as a
+        # win. So regress the per-caption change on its STARTING score across the whole bank and
+        # report the target's residual: what moved beyond what its starting level predicts.
+        s0m = s0.mean(0)
+        A = torch.stack([torch.ones_like(s0m), s0m], dim=1)
+        try:
+            coef = torch.linalg.lstsq(A, d.unsqueeze(1)).solution.squeeze(1)
+            spec_adj = float(d[i_t] - (coef[0] + coef[1] * s0m[i_t]))
+        except Exception:
+            spec_adj = float("nan")
+        ov = r.get("region_overlap")
+        hit = (f"{sum(ov['inside']) / len(ov['inside']):>5.0%}/{ov['chance']:.0%}"
+               if ov and ov.get("inside") else "        -")
+        print(f"{r['swap_id']:<36} {r['kind']:<14} {r['separability']:>+8.4f} "
+              f"{float(d[i_t]):>+9.4f} {spec:>+8.4f} {spec_adj:>+9.4f} {hit:>12} "
               f"{sum(r['n_edited']) / len(r['n_edited']):>5.0f}/{r['length']:<3} "
               f"{sum(r['identity_to_original']) / len(r['identity_to_original']):>6.1%} "
               f"{r['rounds_run']:>5}")
-    print("\n[edit] sep <= 0 means the classifier does not separate that swap's two captions on "
-          "the untouched\n[edit] protein; that row is uninformative however it moves. A swap whose "
-          "`spec` does not beat its\n[edit] own __decoy row moved toward captions in general, not "
-          "toward this one.")
+    print("\n[edit] hit = share of the residues actually unfrozen that fell inside the annotated "
+          "region, over\n[edit] the chance rate for a span that size. THIS IS THE ARM'S OWN "
+          "PREMISE: on Sho1 the alignment\n[edit] put 100% of its top-20 in the transmembrane "
+          "helices and 90-95% in the SH3 domain, against\n[edit] 32% and 17% chance. A run where "
+          "hit sits at chance selected nothing meaningful, and nothing\n[edit] downstream of it "
+          "is worth reading.")
+    print("[edit] spec_adj corrects spec for regression to the mean -- degrading a protein raises "
+          "every low\n[edit] score and lowers every high one, which raw spec scores as steering. "
+          "Read spec_adj.")
+    print("[edit] sep <= 0 means the classifier does not separate that swap's two captions on the "
+          "untouched\n[edit] protein; that row is uninformative however it moves.")
+    print("[edit] And none of these columns is evidence: the score reported is the score optimised, "
+          "and now\n[edit] also the score that chose the positions. Only the oracles settle a row.")
 
 
 def main():
@@ -297,7 +385,9 @@ def main():
     ap.add_argument("--only", default=None, help="colon-separated swap ids")
     ap.add_argument("--kinds", default="swap:control_null:control_decoy")
     ap.add_argument("--n", type=int, default=4, help="replicates per swap, batched")
-    ap.add_argument("--rounds", type=int, default=12)
+    ap.add_argument("--rounds", type=int, default=1,
+                    help="1 = pre-diffusion masking: unfreeze the whole budget at once and decode. "
+                         ">1 = the iterative loop, re-selecting each round.")
     ap.add_argument("--k", type=int, default=8, help="positions edited per round")
     ap.add_argument("--max-edit-frac", type=float, default=0.20)
     ap.add_argument("--stop-frac", type=float, default=1.0,
@@ -307,6 +397,14 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--contrast", action=argparse.BooleanOptionalAction, default=True,
                     help="put the CURRENT caption in the softmax bank (the push, not just a pull)")
+    ap.add_argument("--select", default="filip", choices=("filip", "tag", "random"),
+                    help="how residues are chosen. filip = the positions most aligned with the "
+                         "text tokens the swap deletes (pre-diffusion masking); tag = the old "
+                         "gradient selector; random = the floor.")
+    ap.add_argument("--align-side", default="removed", choices=("removed", "added", "both"))
+    ap.add_argument("--dilate", type=int, default=2,
+                    help="grow each aligned seed by +/- this many residues. Domains are "
+                         "contiguous and the alignment is peaky; 0 selects isolated residues.")
     ap.add_argument("--guide-mode", default="tag", choices=("tag", "deg"))
     ap.add_argument("--guide-chunk", type=int, default=4)
     ap.add_argument("--filip-ckpt", default=FILIP_CKPT)

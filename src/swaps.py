@@ -74,6 +74,37 @@ SWAPS = [
         ],
     ),
     dict(
+        swap_id="sho1_membrane_to_cytosol",
+        acc="P40073",
+        summary="Sho1 made cytosolic instead of a multi-pass membrane protein",
+        # THE SWAP THE ALIGNMENT EVIDENCE POINTS AT. Measured on the Sho1 homolog E7QE10, the text
+        # tokens "multi", "-", "pass" put 100% of their top-20 aligned residues inside the
+        # transmembrane helices (chance 32%) and "membrane" puts 75% there. So the tokens this swap
+        # deletes have a sharp, verified protein correlate, which is exactly what pre-diffusion
+        # masking needs: there is a specific set of residues to take out.
+        phrasing_from=["P0A9Q3 (arca: 'SUBCELLULAR LOCATION: cytoplasm', GO 'cytosol')"],
+        oracle="Transmembrane-helix prediction (DeepTMHMM/Phobius, or a Kyte-Doolittle 19-residue "
+               "window). Sho1 has FOUR TM helices across roughly residues 29-145; a cytosolic Sho1 "
+               "should have none. This is the only swap here whose oracle counts DOWN from a large "
+               "number rather than up from zero, which makes partial success visible.",
+        edits=[
+            ("SUBCELLULAR LOCATION: cell membrane; multi-pass membrane protein bud bud neck "
+             "cell projection",
+             "SUBCELLULAR LOCATION: cytoplasm bud bud neck cell projection", 1),
+            ("mating projection tip, membrane, plasma membrane, map-kinase",
+             "mating projection tip, cytosol, map-kinase", 1),
+            # Keywords are alphabetical; drop the four membrane terms, add cytoplasm in place.
+            ("3d-structure, cell membrane, cell projection",
+             "3d-structure, cell projection", 1),
+            ("glycoprotein, membrane, phosphoprotein", "cytoplasm, glycoprotein, phosphoprotein", 1),
+            ("stress response, transmembrane, transmembrane helix", "stress response", 1),
+            # FUNCTION asserts the membrane role twice; leaving it would make the caption
+            # self-contradictory, which is not a state SwissProt is ever in.
+            ("FUNCTION: plasma membrane osmosensor", "FUNCTION: cytosolic osmosensor", 1),
+            ("targets pbs2 to the plasma membrane.", "targets pbs2 to the cytosol.", 1),
+        ],
+    ),
+    dict(
         swap_id="lactamase_periplasm_to_cytosol",
         acc="P26918",
         summary="Beta-lactamase that lives in the cytosol instead of the periplasm",
@@ -164,6 +195,29 @@ SWAPS = [
 ]
 
 
+# The residue span (0-based, half-open) each swap's deleted phrase SHOULD point at. This is the
+# ground truth for the position selector: src/edit.py reports what fraction of the residues it
+# unfroze landed inside, against the chance rate for a span that size. Verified on the Sho1
+# homolog E7QE10, where "multi/-/pass" scored 100% of its top-20 inside the TM helices and
+# "sh3 domain" 90-95% inside the SH3 domain, against chance of 32% and 17%.
+#
+# Anchored to motifs where a motif fixes them, so a sequence change cannot leave a stale span.
+def region_for(swap_id: str, seq: str):
+    if swap_id == "sho1_sh3_to_pdz":
+        i = seq.find("ALYPY")                  # the canonical SH3 N-terminal motif
+        return (i, len(seq)) if i > 0 else None
+    if swap_id == "sho1_membrane_to_cytosol":
+        return (28, 146)                       # the four TM helices, UniProt-annotated
+    if swap_id == "lactamase_periplasm_to_cytosol":
+        return (0, 27)                         # the cleaved signal peptide
+    if swap_id == "trypsin_catalytic_to_dead":
+        i = seq.find("GDSGGP")                 # the nucleophile elbow
+        return (i - 6, i + 12) if i > 6 else None
+    if swap_id == "hox2_dimer_to_monomer":
+        return (170, 230)                      # the leucine zipper, C-terminal to the homeodomain
+    return None                                # arca installs a helix; there is nothing to point at
+
+
 def apply_edits(caption: str, edits):
     """-> (edited caption, [(find, n_applied)]). Raises on a count that does not match."""
     out, log = caption, []
@@ -217,6 +271,7 @@ def build(csv_path=None, decoy=DECOY_ACC):
         base = dict(accession=spec["acc"], cache_row=r["row"], length=len(r["seq"]),
                     sequence=r["seq"], caption_current=r["caption"])
         out.append(dict(base, swap_id=spec["swap_id"], kind="swap",
+                        region=region_for(spec["swap_id"], r["seq"]),
                         summary=spec["summary"], oracle=spec["oracle"],
                         phrasing_from=spec["phrasing_from"],
                         edits=[[f, t] for f, t, _ in spec["edits"]], edit_log=log,

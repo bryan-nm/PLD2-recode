@@ -378,6 +378,32 @@ class FilipGuidance:
             z_p, z_t.to(self.device), mask_p, mask_t.to(self.device))
 
     @torch.no_grad()
+    def align_to_text(self, aa_canvas: torch.Tensor, z_t, mask_t) -> torch.Tensor:
+        """[B, L_canvas, L_t] cosine between every canvas position and every text token.
+
+        THIS TENSOR IS ALREADY COMPUTED AND THROWN AWAY. losses.filip_score_matrix forms
+        einsum("bld,cmd->bclm", z_p, z_t) and immediately reduces it to two means -- and those
+        means are a badly attenuated readout of it. The t->p half divides by the number of text
+        tokens, ~280 for these captions, so rewriting a whole field moves the total by at most a
+        couple of percent; the p->t half can move the OTHER WAY at the same time, because a protein
+        position whose best text token was deleted simply finds the next best one. Measured: an
+        unrelated caption moves the score 0.28, a minimally edited one 0.006. Read locally instead
+        and the same model localises "multi-pass membrane protein" to Sho1's transmembrane helices
+        at 100% of the top 20 (chance 32%) and "sh3 domain" to its SH3 domain at 90-95% (chance 17%).
+
+        INDEXED BY CANVAS POSITION, so no caller has to know the framing. CanvasBridge lays out
+        [cls] + canvas + [eos], so AMPLIFY index j is canvas position j-1; that slice happens here,
+        once. Invalid positions (PAD, MASK, EOS) come back as -inf so a max over them cannot win.
+        """
+        L = aa_canvas.shape[1]
+        ids, attn, live = self.bridge.to_amplify(aa_canvas)
+        z_p, mask_p = self._encode(ids, attn, live)
+        sim = torch.einsum("bld,cmd->bclm", z_p, z_t.to(self.device))[:, 0]    # [B, L+2, L_t]
+        sim = sim[:, 1:L + 1]                                                  # -> canvas positions
+        sim = sim.masked_fill(~live.unsqueeze(-1), float("-inf"))
+        return sim.masked_fill(~mask_t.to(self.device)[0].view(1, 1, -1), float("-inf"))
+
+    @torch.no_grad()
     def tag_delta(self, canvas: torch.Tensor) -> torch.Tensor:
         """[B, L, 20]: how much each (position, residue) would move the target log-probability.
 
