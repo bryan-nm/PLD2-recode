@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+
+# Runs / artifacts (paths owned by config.py; kept out of the repo)
+checkpoints/
+runs/
+samples/
+*.pt
+*.ckpt
+*.safetensors
+*.fasta
+*.jsonl
+
+# Preprocessed data
+*.bin
+*.idx
+*_shards/
+
+# PBS job output. `#PBS -j oe` merges stdout+stderr into <jobname>.o<jobid> in the submit
+# directory, which is the repo root -- so every run drops a log next to the source and a
+# `git add -A` sweeps it in. Three of them (1.6MB) reached main that way before this existed.
+*.o[0-9]*
+*.e[0-9]*
+*.log
+
+# Local env overrides
+.env
