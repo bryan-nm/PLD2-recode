@@ -64,6 +64,25 @@ _AA_ID = {c: i for i, c in enumerate(AA)}
 _DI_ID = {c: i for i, c in enumerate(DI)}
 
 
+def _decode(model, dev, **kw):
+    """Every call into the PLD2 model goes through here, under autocast.
+
+    ipex.optimize(dtype=bfloat16) rewrites the weights to bf16 while the canvas stays long and the
+    embeddings come out fp32, so a forward outside autocast dies on `expected self and mat2 to have
+    the same dtype, but got: float != c10::BFloat16` -- deep inside the attention qkv projection,
+    where it reads as a model bug rather than a missing context manager. Every other caller in PLD2
+    wraps generate() this way; this wrapper exists so there is one place to forget it rather than
+    two, and neither of them is a bare call site.
+
+    The FILIP scoring path deliberately does NOT go through here: AMPLIFY is never ipex-optimised,
+    so it stays fp32, and the separability numbers are the one quantity in this experiment worth
+    keeping at full precision.
+    """
+    with torch.no_grad(), torch.autocast(device_type=dev.type, dtype=torch.bfloat16,
+                                         enabled=dev.type in ("xpu", "cuda")):
+        return generate(model, device=str(dev), **kw)
+
+
 def encode_canvas(seq, mcfg, canvas, di=None, n_tracks=2):
     """(K, canvas) long, laid out exactly as training does: [AA* EOS PAD*] in track 0, and the 3Di
     track padded from the boundary INCLUSIVE with no EOS of its own."""
@@ -92,11 +111,11 @@ def prime_structure(model, tok, mcfg, dcfg, dev, n, steps=None, seed=0):
     given[:, 0] = True                      # the whole amino-acid track is context
     given[:, 1:, L:] = True                 # the structure track's PAD tail; residues are free
     torch.manual_seed(seed)
-    cv, _ = generate(model, Lmax=dcfg.canvas, batch_size=B, n_steps=steps or dcfg.canvas,
-                     device=str(dev), temperature=CFG.opt.sample_temperature,
-                     gumbel_temp=CFG.opt.sample_gumbel_temp,
-                     rep_penalty=0.0, max_run=0, min_len=CFG.opt.sample_min_len,
-                     prompt=prompt, prompt_mask=given)
+    cv, _ = _decode(model, dev, Lmax=dcfg.canvas, batch_size=B,
+                    n_steps=steps or dcfg.canvas, temperature=CFG.opt.sample_temperature,
+                    gumbel_temp=CFG.opt.sample_gumbel_temp,
+                    rep_penalty=0.0, max_run=0, min_len=CFG.opt.sample_min_len,
+                    prompt=prompt, prompt_mask=given)
     return cv, L
 
 
@@ -182,13 +201,13 @@ def run_swap(rec, model, guide, capenc, bank_z, bank_mask, bank_names, mcfg, dcf
         given[:, :, :] = ~picked.unsqueeze(1)          # free the picks in BOTH tracks
         given[:, :, L:] = True                         # EOS and the PAD tail stay context
         torch.manual_seed(a.seed + 7919 * rnd)
-        cv, _ = generate(model, Lmax=dcfg.canvas, batch_size=B,
-                         n_steps=max(2 * a.k, 8), device=str(dev),
-                         temperature=a.temperature, gumbel_temp=CFG.opt.sample_gumbel_temp,
-                         rep_penalty=CFG.opt.sample_rep_penalty,
-                         rep_periods=CFG.opt.sample_rep_periods, max_run=CFG.opt.sample_max_run,
-                         min_len=CFG.opt.sample_min_len, guidance_fn=guide,
-                         prompt=cv, prompt_mask=given)
+        cv, _ = _decode(model, dev, Lmax=dcfg.canvas, batch_size=B,
+                        n_steps=max(2 * a.k, 8),
+                        temperature=a.temperature, gumbel_temp=CFG.opt.sample_gumbel_temp,
+                        rep_penalty=CFG.opt.sample_rep_penalty,
+                        rep_periods=CFG.opt.sample_rep_periods, max_run=CFG.opt.sample_max_run,
+                        min_len=CFG.opt.sample_min_len, guidance_fn=guide,
+                        prompt=cv, prompt_mask=given)
         ever |= picked
         seqs = decode_seqs(cv, mcfg)[0]
         traj.append(dict(round=rnd, n_edited=ever.sum(1).cpu().tolist(),

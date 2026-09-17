@@ -117,9 +117,21 @@ if has S; then
     # shellcheck disable=SC2086
     "${MPI_LAUNCH[@]}" python -m src.edit "${COMMON[@]}" --rounds 0 --out "${SEPAR}" \
         ${CKPT_FLAG} ${ONLY_FLAG} ${CONTRAST_FLAG} ${EDIT_ARGS:-}
+    src=$?
     phase "S-separability" $t0
     echo "[edit] separability:"
+    # `|| true` here and NOT on ${src}: with a dead rank there may be nothing to summarise, and
+    # that is a consequence of the failure rather than a second one.
     python -m src.edit --summarize "${SEPAR%.jsonl}"*.jsonl || true
+    if [ $src -ne 0 ]; then
+        # THE GATE HAS TO FAIL THE JOB. The first version captured no status here, so a run in
+        # which every rank died still printed "nothing to summarize" and exited 0 -- a green job
+        # with no measurement in it, which is the worst outcome a gate can produce.
+        echo "[edit] phase S exited ${src}: the separability gate did NOT complete, so any" >&2
+        echo "[edit] table above is partial. Not continuing." >&2
+        rc=$src
+        echo "[job] exit $rc"; exit $rc
+    fi
     echo "[edit] Read the sep column. A swap at or below 0 is not a failed edit -- it is a swap"
     echo "[edit] whose two captions this classifier cannot tell apart on this protein, and no"
     echo "[edit] amount of guidance will produce a specific edit for it."
