@@ -89,18 +89,65 @@ Left behind: the whole alignment pipeline — `align.py`, `align_sample.py`, `al
 `preference.py`, `prompts.py`, and the preprocessing/sweep tooling. `tm_align.py` had its one
 dependency on the alignment prompt manifest inlined so the tree's imports close on their own.
 
-## Status and next steps
+## Generation
 
-`data/swaps.jsonl` is built and validated. Nothing else is implemented yet.
+```bash
+qsub -v PHASES=VS scripts/edit.pbs     # the two gates first -- do this before anything else
+qsub scripts/edit.pbs                  # verify, separability, edit, report
+qsub -v PHASES=R scripts/edit.pbs      # re-read the table, no GPU
+```
 
-**The next step is the separability check, and it is a gate.** Before any editing code: score each
-*original* protein against both its current and its target caption. If `s(x₀,c₀) − s(x₀,c₁)` is
-near zero, FILIP does not distinguish the two captions and no amount of guidance will produce a
-specific edit. That gap is also the **budget** — the stopping criterion is "edit until `s(x,c₁)`
-reaches `s(x₀,c₀)`", so it is exactly how far guidance has to travel.
+The loop, per swap: the protein starts fully committed; each round asks TAG where it is most
+improvable (`gain[i] = max_a Δ[i,a] − Δ[i,x_i]`, free — the gradient is computed anyway to bias the
+logits), unfreezes the top-k in both tracks, and redecodes them under guidance with everything else
+frozen. It stops when the protein matches the target caption about as well as it originally matched
+its own. `--contrast` puts the *current* caption in the softmax bank, which makes the objective
+"raise the target at the expense of the current" rather than "raise the target" — the push rather
+than a drift, with no new loss function.
 
-One thing that check needs: **the target captions are new text and are not in the FILIP cache.**
-`filip_guidance.PromptCache` deliberately never runs the text encoder. So this fork has to load
-BioLinkBERT and encode the swapped captions itself — using the same `caption_field_labels`,
-`mask_field_labels` and length cap the cache was built with. Those settings are recorded in the
-cache's `fingerprint.json`; read and assert them rather than assuming.
+### Two gates, and they come first
+
+**V — captions round-trip** (`src.captions verify`). A swapped target is text nobody has encoded,
+so this fork loads BioLinkBERT itself. mini-embed registers the caption field labels as single
+special tokens, and an encoding made without that registration still produces a perfectly
+well-formed tensor — one that simply lives somewhere else in the space. *Nothing errors.* So the
+fingerprint is asserted, and then captions that *are* cached are re-encoded and compared. Below
+1.0 cosine, stop.
+
+**S — separability** (`--rounds 0`). Score each untouched protein against every caption in the
+experiment. If `s(x₀,c₀) − s(x₀,c₁) ≲ 0` for a swap, FILIP does not distinguish those two captions
+on that protein and the row means nothing however it moves — `src.edit` says so explicitly rather
+than reporting a quiet zero. That gap is also the **budget**: it is exactly how far guidance has to
+travel. Phase S is the edit loop with the rounds turned off, so it costs one scoring pass.
+
+### Reading the table
+
+```
+swap                     kind             sep  d target  d current     spec   edited   ident  rnds
+arca_cytosol_to_membrane swap         +0.2294   +0.2122    -0.0993  +0.2162   34/238  85.9%     6
+arca..._to_membrane__decoy control_decoy -0.3584  +0.0000   +0.0000  +0.0000    0/238 100.0%     0
+```
+
+`spec` is the column that matters: the target's gain minus the mean gain across every *other*
+swap's target caption. A protein that drifts toward every caption in the bank has not been steered,
+and only this can tell the difference — which is why every round scores against the whole bank. A
+swap whose `spec` does not beat its own `__decoy` row moved toward captions in general.
+
+**And none of it is evidence on its own: the score being reported is the score being optimised.**
+What settles a row is its oracle — SignalP, a TM-helix call, `GDSGGP`, a coiled-coil call, an HMM
+scan. Those are not implemented yet; `python -m src.swaps show <id>` prints what each one is.
+
+## Status
+
+Implemented and smoke-tested end to end on CPU: the swap definitions, the caption encoder and its
+round-trip check, the edit loop, the separability gate, the summary table, and `scripts/edit.pbs`.
+
+`src/stub_filip.py` replaces FILIP with a toy objective (caption → random unit vector over the 20
+residues; score = cosine to the protein's composition) so the whole loop runs on a laptop without
+the Aurora assets. It is a real objective, not a constant — the TAG surrogate is its exact
+first-order gradient — which is what makes the smoke test mean anything: the loop demonstrably
+drives the target score up and the current score down, nulls make zero edits at 100% identity, and
+swaps beat their decoy rows on `spec`. Every stubbed result is labelled as such in the table.
+
+**Not implemented: the oracles, and folding the edits.** That is what turns a FILIP number into
+evidence.

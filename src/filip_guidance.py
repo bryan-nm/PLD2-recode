@@ -338,12 +338,76 @@ class FilipGuidance:
         name = self.prompts.ids[r] if r < len(self.prompts.ids) else str(r)
         return name
 
+    # --- editing: targets that are not in the cache ------------------------
+    def set_target_encoded(self, z_t, mask_t):
+        """Condition on an already-projected caption embedding.
+
+        A swapped target caption is text nobody has encoded, so it cannot come from the cache.
+        src/captions.CaptionEncoder produces exactly what PromptCache.encode produces -- and
+        verifies that by round-tripping cached captions -- so the two are interchangeable here.
+        """
+        if z_t.dim() != 3 or z_t.shape[0] != 1:
+            raise ValueError(f"target must be [1, Lt, D]; got {tuple(z_t.shape)}")
+        self._z_t, self._mask_t = z_t.to(self.device), mask_t.to(self.device)
+
+    def set_bank_encoded(self, z_bank, mask_bank):
+        """The contrastive denominator.
+
+        With likelihood="softmax_bank" the objective is
+            log p(target | x) = logit_target - logsumexp([logit_target] + bank logits)
+        so putting the CURRENT caption in the bank makes this literally "increase the target's
+        score at the expense of the current one" -- the push from one caption to another, with no
+        new loss function. `bank_rows` at construction time cannot express it because the current
+        caption differs per protein.
+        """
+        self._z_bank = None if z_bank is None else z_bank.to(self.device)
+        self._mask_bank = None if mask_bank is None else mask_bank.to(self.device)
+
+    @torch.no_grad()
+    def raw_scores(self, canvas: torch.Tensor, z_t, mask_t) -> torch.Tensor:
+        """[B, M] FILIP similarity of each canvas row against each of M captions.
+
+        The RAW score, not a log-probability: this is the quantity the stopping criterion is
+        expressed in ("edit until s(x, target) reaches s(x0, current)"), and the one the
+        separability measurement reports. FILIP scores are not calibrated in absolute terms, which
+        is exactly why the threshold is a per-protein reference point rather than a constant.
+        """
+        ids, attn, live = self.bridge.to_amplify(canvas)
+        z_p, mask_p = self._encode(ids, attn, live)
+        return self.mods["losses"].filip_score_matrix(
+            z_p, z_t.to(self.device), mask_p, mask_t.to(self.device))
+
+    @torch.no_grad()
+    def tag_delta(self, canvas: torch.Tensor) -> torch.Tensor:
+        """[B, L, 20]: how much each (position, residue) would move the target log-probability.
+
+        The same tensor __call__ adds to the logits, exposed on its own so the edit loop can use it
+        to CHOOSE positions. It is free -- the gradient is computed anyway -- and it is the natural
+        answer to "where is this protein most improvable", which is otherwise a separate model.
+        """
+        ids, attn, live = self.bridge.to_amplify(canvas)
+        if not bool(live.any()):
+            return torch.zeros(canvas.shape[0], canvas.shape[1], 20, device=canvas.device)
+        return self._tag(ids, attn, live)
+
     # --- classifier --------------------------------------------------------
     def _log_prob(self, z_p, mask_p):
         """log p(target prompt | sequence) -> [B], differentiable."""
         fs = self.mods["losses"].filip_score_matrix
         s = fs(z_p, self._z_t, mask_p, self._mask_t).squeeze(1)          # [B]
         if self.likelihood == "sigmoid":
+            return F.logsigmoid(self.scale * s)
+        if self._z_bank is None:
+            # An EMPTY BANK IS A LEGITIMATE STATE, not an error: src/edit.py's --no-contrast asks
+            # for exactly this -- pull toward the target with nothing to push away from. The
+            # softmax over a single logit is identically 0, which would make the whole term
+            # vanish, so fall back to the sigmoid likelihood, which is what "unnormalised pull"
+            # means. Said out loud because a silent switch of objective is worse than a crash.
+            if not getattr(self, "_warned_empty_bank", False):
+                self._warned_empty_bank = True
+                print("[filip] likelihood=softmax_bank with an EMPTY bank -> using sigmoid. "
+                      "There is nothing to contrast against, so this is a pull toward the target, "
+                      "not a push from one caption to another.", flush=True)
             return F.logsigmoid(self.scale * s)
         s_bank = fs(z_p, self._z_bank, mask_p, self._mask_bank)          # [B, M]
         logits = self.scale * torch.cat([s[:, None], s_bank], dim=1)

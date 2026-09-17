@@ -88,15 +88,22 @@ def _step_logits(model, canvas, guidance_fn, ban_eos: bool = False, eos_min_pos:
 _WARNED_STEPS = False
 
 
-def _warn_if_too_few_steps(n_steps, Lmax):
+def _warn_if_too_few_steps(n_steps, n_free):
+    """`n_free` is the positions actually IN PLAY, not the canvas width.
+
+    Comparing against Lmax was right when every decode started from a blank canvas and wrong as
+    soon as prompting existed: an edit round frees 8 positions out of 384 and runs 16 steps, which
+    is four steps per position and about as gentle as decoding gets -- yet the Lmax test called it
+    32 positions a step and fired on every round of every run.
+    """
     global _WARNED_STEPS
-    if not _WARNED_STEPS and n_steps < Lmax // 2:
+    if not _WARNED_STEPS and n_free > 8 and n_steps < n_free // 2:
         _WARNED_STEPS = True
-        print(f"[sampler] WARNING: n_steps={n_steps} on a {Lmax}-wide canvas commits "
-              f"~{Lmax / max(n_steps, 1):.0f} positions per step. The repetition penalty scores "
-              f"each position against the canvas BEFORE that batch commits, so co-committed "
-              f"positions are invisible to one another and the penalty is largely inert. "
-              f"Use n_steps ~= {Lmax}.", flush=True)
+        print(f"[sampler] WARNING: n_steps={n_steps} against {n_free} free position(s) commits "
+              f"~{n_free / max(n_steps, 1):.0f} per step. The repetition penalty scores each "
+              f"position against the canvas BEFORE that batch commits, so co-committed positions "
+              f"are invisible to one another and the penalty is largely inert. "
+              f"Use n_steps ~= {n_free}.", flush=True)
 
 
 # --------------------------------------------------------------------------------------
@@ -514,9 +521,9 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
     model.eval()
 
     guides = []
-    if rep_penalty > 0 or max_run:
+    want_step_warning = bool(rep_penalty > 0 or max_run)
+    if want_step_warning:
         guides.append(make_repetition_penalty(cfg, rep_penalty, rep_periods, max_run))
-        _warn_if_too_few_steps(n_steps, Lmax)
     if guidance_fn is not None:
         guides.append(guidance_fn)
 
@@ -579,6 +586,11 @@ def generate(model: LoopedDiffusionLM, Lmax: int, batch_size: int,
     # spends its whole step budget on the 40%.
     # Summed over BOTH tracks: the schedule's budget is slots, and a structure slot costs a commit
     # exactly like a residue slot does.
+    # AFTER the prompt has been applied, so the count is what is actually free rather than the
+    # canvas width -- see _warn_if_too_few_steps.
+    if want_step_warning:
+        _warn_if_too_few_steps(n_steps, int(is_masked[:, 0].sum(dim=1).max()))
+
     n_active = is_masked.flatten(1).sum(dim=1).to(torch.float32)
     sf_steps = max(0.0, float(struct_first)) * n_steps
 

@@ -1,0 +1,156 @@
+#!/bin/bash -l
+#PBS -A NLDesignProtein
+#PBS -N pld2_edit
+#PBS -l walltime=02:00:00
+#PBS -l select=1
+#PBS -l place=scatter
+#PBS -l filesystems=home_fs:flare_fs
+#PBS -q debug
+#PBS -j oe
+
+# Caption-directed editing: push each protein from its own caption toward a swapped one.
+#
+#   qsub scripts/edit.pbs                                  # verify, separability, edit, report
+#   qsub -v PHASES=VS scripts/edit.pbs                     # the two gates only -- do this FIRST
+#   qsub -v ONLY=arca_cytosol_to_membrane,N=8 scripts/edit.pbs
+#   qsub -v GAMMA=30,K=12,ROUNDS=20 scripts/edit.pbs
+#   qsub -v PHASES=R scripts/edit.pbs                      # re-read the table, no GPU needed
+#
+# RUN THE GATES BEFORE THE EXPERIMENT. Two things can make every number downstream meaningless,
+# and both are cheap to check first:
+#
+#   V  captions round-trip. A swapped target caption is text nobody has encoded, so this fork loads
+#      BioLinkBERT and encodes it -- and mini-embed registers the caption field labels as single
+#      special tokens, so an encoding made without that registration still produces a perfectly
+#      well-formed tensor that simply lives somewhere else in the space. Nothing errors. src.captions
+#      re-encodes captions that ARE cached and compares; below 1.0 cosine, stop.
+#   S  separability. Score each untouched protein against its own caption and its target. If
+#      s(x0,current) - s(x0,target) is ~0 for a swap, FILIP does not distinguish those two captions
+#      on that protein, and that row's result means nothing however it moves. That gap is also the
+#      BUDGET: the stopping rule is "edit until the target scores what the current one did", so it
+#      is exactly how far guidance has to travel. Phase S is phase E with --rounds 0, so it costs
+#      one scoring pass and no edits.
+#
+# WHY THIS SHOULD WORK WHERE COLD START DID NOT. PLD2's infilling runs 75.5% success at mask rate
+# 0.50 and 0.0% at 1.0; editing 5-20% of a protein sits off the easy end of that curve. And every
+# FILIP guidance number so far was measured on a half-masked canvas, which is out of distribution
+# for AMPLIFY's protein encoder -- here it reads a complete protein, which is what it was trained on.
+#
+# NO PROCESS GROUP. src.edit calls init_distributed(no_dist=True): each rank pins its own tile,
+# partitions the swap records by index, and writes its own JSONL. Nothing is aggregated, so oneCCL
+# is never initialised -- the same decision src/fold_fasta.py made, and one fewer way to die on a
+# node that is also holding AMPLIFY and BioLinkBERT.
+#
+# MEMORY. Each rank holds PLD2 (1.35B), AMPLIFY and BioLinkBERT at once, and TAG's backward keeps a
+# [chunk, heads, L, L] attention matrix per AMPLIFY layer. GUIDE_CHUNK is the knob that cost a job
+# once already: 8 was ~3.8GB, 64 was 30GB and an OUT_OF_RESOURCES abort. It defaults to 4 here
+# because N replicates are batched together on top of everything else.
+cd "${PBS_O_WORKDIR:?submit with qsub from the repo root}" || exit 1
+source ./scripts/pbs_common.sh
+
+PHASES=${PHASES:-VSER}
+N=${N:-4}                     # replicates per swap, batched in one canvas
+ROUNDS=${ROUNDS:-12}
+K=${K:-8}                     # positions edited per round
+GAMMA=${GAMMA:-10}            # measured on the alignment side: the best-of-N gain collapses as
+                              # guidance rises (5.7x at 10, 2.7x at 30, 1.9x at 100). Editing is a
+                              # different regime, but 10 is where the evidence is.
+MAX_EDIT_FRAC=${MAX_EDIT_FRAC:-0.20}
+STOP_FRAC=${STOP_FRAC:-1.0}
+TEMP=${TEMP:-0.8}
+GUIDE_CHUNK=${GUIDE_CHUNK:-4}
+GUIDE_MODE=${GUIDE_MODE:-tag}
+CONTRAST=${CONTRAST:-1}       # 0 -> pull toward the target only, with nothing to push away from
+KINDS=${KINDS:-swap:control_null:control_decoy}
+SEED=${SEED:-0}
+
+RUNS=$(python -c "from config import RUNS_DIR; print(RUNS_DIR)")
+OUT_DIR=${OUT_DIR:-${RUNS}/recode}
+EDITS="${OUT_DIR}/edits.jsonl"
+SEPAR="${OUT_DIR}/separability.jsonl"
+mkdir -p "${OUT_DIR}"
+
+job_banner "PLD2-recode caption-directed editing" PHASES N ROUNDS K GAMMA MAX_EDIT_FRAC \
+           STOP_FRAC TEMP GUIDE_CHUNK GUIDE_MODE CONTRAST ONLY OUT_DIR CKPT
+
+has() { [[ "${PHASES}" == *"$1"* ]]; }
+declare -A PHASE_T
+phase() { local n="$1" t0="$2"; PHASE_T[$n]=$(( SECONDS - t0 )); \
+          echo "[edit] --- ${n} took ${PHASE_T[$n]}s ---"; }
+
+CKPT_FLAG=""; [ -n "${CKPT:-}" ] && CKPT_FLAG="--ckpt ${CKPT}"
+ONLY_FLAG=""; [ -n "${ONLY:-}" ] && ONLY_FLAG="--only ${ONLY}"
+CONTRAST_FLAG="--contrast"; [ "${CONTRAST}" = "0" ] && CONTRAST_FLAG="--no-contrast"
+COMMON=( --device xpu --n "${N}" --k "${K}" --gamma "${GAMMA}"
+         --max-edit-frac "${MAX_EDIT_FRAC}" --stop-frac "${STOP_FRAC}"
+         --temperature "${TEMP}" --guide-chunk "${GUIDE_CHUNK}" --guide-mode "${GUIDE_MODE}"
+         --kinds "${KINDS}" --seed "${SEED}" )
+rc=0
+
+# --- the swap definitions (cheap; rebuilt if absent, always re-validated) ----------------------
+if [ ! -f data/swaps.jsonl ]; then
+    echo "[edit] building data/swaps.jsonl from the SwissProt CSV"
+    python -m src.swaps build || exit 1
+fi
+python -m src.swaps check || { echo "[edit] swap definitions do not validate." >&2; exit 1; }
+
+# --- V: does the fresh caption encoder reproduce the cache? -------------------------------------
+if has V; then
+    t0=$SECONDS
+    echo "[edit] phase V: round-tripping cached captions through the fresh encoder"
+    python -m src.captions verify --device cpu --n "${VERIFY_N:-16}"
+    vrc=$?
+    phase "V-verify" $t0
+    if [ $vrc -ne 0 ]; then
+        echo "[edit] CAPTION ENCODING DOES NOT MATCH THE CACHE. A score against a freshly" >&2
+        echo "[edit] encoded caption would not be comparable with one against a cached caption," >&2
+        echo "[edit] which is the entire measurement here. Stopping before anything else runs." >&2
+        exit 1
+    fi
+fi
+
+# --- S: separability, which is the gate on every row downstream ---------------------------------
+if has S; then
+    t0=$SECONDS
+    echo "[edit] phase S: scoring the untouched proteins against every caption (--rounds 0)"
+    rm -f "${SEPAR%.jsonl}"*.jsonl
+    # shellcheck disable=SC2086
+    "${MPI_LAUNCH[@]}" python -m src.edit "${COMMON[@]}" --rounds 0 --out "${SEPAR}" \
+        ${CKPT_FLAG} ${ONLY_FLAG} ${CONTRAST_FLAG} ${EDIT_ARGS:-}
+    phase "S-separability" $t0
+    echo "[edit] separability:"
+    python -m src.edit --summarize "${SEPAR%.jsonl}"*.jsonl || true
+    echo "[edit] Read the sep column. A swap at or below 0 is not a failed edit -- it is a swap"
+    echo "[edit] whose two captions this classifier cannot tell apart on this protein, and no"
+    echo "[edit] amount of guidance will produce a specific edit for it."
+fi
+
+# --- E: the edit loop ---------------------------------------------------------------------------
+if has E; then
+    t0=$SECONDS
+    echo "[edit] phase E: ${ROUNDS} rounds x ${K} positions, budget ${MAX_EDIT_FRAC}, on ${NRANKS} tile(s)"
+    # Resumable: each rank appends to its own JSONL and skips swap ids already in it, so a fault
+    # costs the record in flight rather than the run.
+    # shellcheck disable=SC2086
+    "${MPI_LAUNCH[@]}" python -m src.edit "${COMMON[@]}" --rounds "${ROUNDS}" --out "${EDITS}" \
+        ${CKPT_FLAG} ${ONLY_FLAG} ${CONTRAST_FLAG} ${EDIT_ARGS:-}
+    rc=$?
+    phase "E-edit" $t0
+fi
+
+# --- R: the table -------------------------------------------------------------------------------
+if has R; then
+    echo "[edit] phase R:"
+    python -m src.edit --summarize "${EDITS%.jsonl}"*.jsonl || rc=$?
+    echo ""
+    echo "[edit] The edited sequences are in ${EDITS}. NOTHING HERE IS EVIDENCE ON ITS OWN:"
+    echo "[edit] the score being reported is the score being optimised. What settles a row is its"
+    echo "[edit] oracle -- SignalP for the periplasm swap, a TM-helix call for the membrane one,"
+    echo "[edit] GDSGGP for trypsin, a coiled-coil call for the zipper, an HMM scan for SH3/PDZ."
+    echo "[edit] \`python -m src.swaps show <id>\` prints each one."
+fi
+
+echo ""
+echo "[edit] phase timings"
+for k in "${!PHASE_T[@]}"; do printf '  %-18s %6ss\n' "$k" "${PHASE_T[$k]}"; done | sort
+echo "[job] exit $rc"; exit $rc     # exit $rc so the EXIT trap reports the true code

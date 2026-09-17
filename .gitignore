@@ -16,6 +16,9 @@ samples/
 *.safetensors
 *.fasta
 *.jsonl
+# ...but data/ is CURATION, not output. swaps.jsonl is the experiment's definition; it is
+# reproducible from src/swaps.py but it is reviewed and versioned like source.
+!data/*.jsonl
 
 # Preprocessed data
 *.bin
