@@ -178,11 +178,20 @@ def run_swap(rec, model, guide, capenc, bank_z, bank_mask, bank_names, mcfg, dcf
 
     z_cur, m_cur = capenc.encode([rec["caption_current"]], guide.filip.text_proj, dev)
     z_tgt, m_tgt = capenc.encode([rec["caption_target"]], guide.filip.text_proj, dev)
-    guide.set_target_encoded(z_tgt, m_tgt)
+    # WHICH CAPTION GUIDANCE PULLS TOWARD. `--guide-toward current` is the arm that can validate
+    # guidance itself: mask the residues the deleted phrase points at, then aim at the caption the
+    # protein ALREADY satisfies and ask an orthogonal oracle whether the feature comes back. That
+    # has a known right answer, which the forward direction does not -- nobody knows whether a
+    # cytosolic Sho1 is reachable, but everybody knows a membrane-anchored one is, because we
+    # started with it. If restoring works and the unguided arm does not restore, guidance installs
+    # features; if restoring fails, the forward direction cannot be expected to work either.
+    z_pull, m_pull = (z_cur, m_cur) if a.guide_toward == "current" else (z_tgt, m_tgt)
+    z_push, m_push = (z_tgt, m_tgt) if a.guide_toward == "current" else (z_cur, m_cur)
+    guide.set_target_encoded(z_pull, m_pull)
     # The contrastive denominator: with likelihood="softmax_bank" this makes the objective
-    # "raise the target's score at the expense of the current one" rather than "raise the target's
-    # score", which is the difference between editing and drifting.
-    guide.set_bank_encoded(z_cur if a.contrast else None, m_cur if a.contrast else None)
+    # "raise the pulled caption's score at the expense of the other" rather than "raise the pulled
+    # caption's score", which is the difference between editing and drifting.
+    guide.set_bank_encoded(z_push if a.contrast else None, m_push if a.contrast else None)
 
     def scores(canvas):
         return guide.raw_scores(aa_track(canvas), bank_z, bank_mask)        # [B, n_bank]
@@ -203,11 +212,15 @@ def run_swap(rec, model, guide, capenc, bank_z, bank_mask, bank_names, mcfg, dcf
     # drifting.
     s_cur0_v, s_tgt0_v = s0[:, i_cur], s0[:, i_tgt]
     sep_v = s_cur0_v - s_tgt0_v
-    stop_at_v = s_tgt0_v + a.stop_frac * sep_v                      # [B]
+    if a.guide_toward == "current":
+        # Restoring: the bar is the level the untouched protein already had.
+        i_move, stop_at_v = i_cur, s_cur0_v
+    else:
+        i_move, stop_at_v = i_tgt, s_tgt0_v + a.stop_frac * sep_v   # [B]
     s_cur0, s_tgt0 = float(s_cur0_v.mean()), float(s_tgt0_v.mean())
     sep, stop_at = s_cur0 - s_tgt0, float(stop_at_v.mean())
 
-    if sep <= 0 and rec["kind"] == "swap":
+    if sep <= 0 and rec["kind"] == "swap" and a.rounds > 1 and a.guide_toward == "target":
         # NOT A FAILURE, AND THE MOST IMPORTANT THING THIS RUN CAN SAY. The stopping rule is "reach
         # what the original already scores against its own caption", so a target that starts at or
         # above that bar is already there and the loop correctly does nothing. What it means is
@@ -243,9 +256,18 @@ def run_swap(rec, model, guide, capenc, bank_z, bank_mask, bank_names, mcfg, dcf
     traj = [dict(round=0, n_edited=[0] * B, scores=s0.float().cpu().tolist(),
                  seqs=decode_seqs(cv, mcfg)[0])]
 
+    # ONE-SHOT IS NOT GATED ON THE SCORE. The stopping criterion answers "have we gone far enough
+    # yet", which is an ITERATIVE question; applied to the first round of a single-round run it
+    # instead answers "should we start", and for a1 -- which masks by alignment and refills from
+    # the prior, never consulting the score -- the answer must always be yes. It was not: a swap
+    # whose separability came out <= 0 did zero rounds, so the unguided arm was silently void on
+    # three of five swaps in the first real run.
+    one_shot = a.rounds == 1
     for rnd in range(1, a.rounds + 1):
         s = scores(cv)
-        active &= (s[:, i_tgt] < stop_at_v) & (ever.sum(1) < budget)
+        active &= (ever.sum(1) < budget)
+        if not one_shot:
+            active &= (s[:, i_move] < stop_at_v)
         if not bool(active.any()):
             break
         # Once the budget is spent a row may only refine what it has already touched, so an edit
@@ -284,6 +306,7 @@ def run_swap(rec, model, guide, capenc, bank_z, bank_mask, bank_names, mcfg, dcf
         n=B, rounds_run=len(traj) - 1, budget=budget, gamma=a.gamma, contrast=bool(a.contrast),
         separability=sep, stop_at=stop_at, bank=bank_names,
         select=a.select, align_side=a.align_side, dilate=a.dilate,
+        guide_toward=a.guide_toward,
         n_changed_tokens=len(removed_tok), first_round_positions=sel0,
         region=rec.get("region"), region_overlap=_overlap(sel0, rec.get("region"), L),
         s0=s0.float().cpu().tolist(), s_final=traj[-1]["scores"],
@@ -325,9 +348,10 @@ def summarize(paths):
         raise SystemExit(f"nothing to summarize in {paths}")
     if any(r.get("stub") for r in recs):
         print("!! STUBBED RUN: these scores come from src/stub_filip.py, not FILIP. !!\n")
-    print(f"{'swap':<36} {'kind':<14} {'sep':>8} {'d target':>9} {'spec':>8} {'spec_adj':>9} "
-          f"{'hit':>12} {'edited':>9} {'ident':>7} {'rnds':>5}")
-    print("-" * 122)
+    toward = {r.get("guide_toward", "target") for r in recs}
+    print(f"{'swap':<34} {'kind':<13} {'sep':>8} {'d target':>9} {'d current':>10} "
+          f"{'spec_adj':>9} {'hit':>11} {'edited':>9} {'ident':>7} {'rnds':>5}")
+    print("-" * 124)
     for r in sorted(recs, key=lambda x: (x["swap_id"].split("__")[0], x["kind"])):
         names, s0, sf = r["bank"], torch.tensor(r["s0"]), torch.tensor(r["s_final"])
         base = r["swap_id"].split("__")[0]
@@ -335,9 +359,6 @@ def summarize(paths):
             continue
         i_t = names.index(base + "/target")
         d = (sf - s0).mean(0)
-        others = [j for j, nm in enumerate(names)
-                  if nm.endswith("/target") and not nm.startswith(base + "/")]
-        spec = float(d[i_t] - (d[others].mean() if others else 0.0))
         # REGRESSION TO THE MEAN IS NOT STEERING, and raw `spec` cannot tell them apart. Damaging a
         # protein pulls every score toward the middle: a caption that started at 0.97 falls and one
         # that started at 0.61 RISES, with nothing steered. Measured on a decoy control, the decoy
@@ -351,11 +372,12 @@ def summarize(paths):
             spec_adj = float(d[i_t] - (coef[0] + coef[1] * s0m[i_t]))
         except Exception:
             spec_adj = float("nan")
+        i_c = names.index(base + "/current")
         ov = r.get("region_overlap")
-        hit = (f"{sum(ov['inside']) / len(ov['inside']):>5.0%}/{ov['chance']:.0%}"
-               if ov and ov.get("inside") else "        -")
-        print(f"{r['swap_id']:<36} {r['kind']:<14} {r['separability']:>+8.4f} "
-              f"{float(d[i_t]):>+9.4f} {spec:>+8.4f} {spec_adj:>+9.4f} {hit:>12} "
+        hit = (f"{sum(ov['inside']) / len(ov['inside']):>4.0%}/{ov['chance']:.0%}"
+               if ov and ov.get("inside") else "       -")
+        print(f"{r['swap_id']:<34} {r['kind']:<13} {r['separability']:>+8.4f} "
+              f"{float(d[i_t]):>+9.4f} {float(d[i_c]):>+10.4f} {spec_adj:>+9.4f} {hit:>11} "
               f"{sum(r['n_edited']) / len(r['n_edited']):>5.0f}/{r['length']:<3} "
               f"{sum(r['identity_to_original']) / len(r['identity_to_original']):>6.1%} "
               f"{r['rounds_run']:>5}")
@@ -370,6 +392,12 @@ def summarize(paths):
           "Read spec_adj.")
     print("[edit] sep <= 0 means the classifier does not separate that swap's two captions on the "
           "untouched\n[edit] protein; that row is uninformative however it moves.")
+    if "current" in toward:
+        print("[edit] THIS IS A RESTORE ARM (guide_toward=current): the column to read is d current, "
+              "and the\n[edit] question is whether the ORACLE finds the masked feature back. It is "
+              "the only arm here with\n[edit] a known right answer -- the protein started with the "
+              "feature, so it is reachable by\n[edit] construction. If restoring fails, nothing in "
+              "the forward direction can be expected to work.")
     print("[edit] And none of these columns is evidence: the score reported is the score optimised, "
           "and now\n[edit] also the score that chose the positions. Only the oracles settle a row.")
 
@@ -402,6 +430,10 @@ def main():
                          "text tokens the swap deletes (pre-diffusion masking); tag = the old "
                          "gradient selector; random = the floor.")
     ap.add_argument("--align-side", default="removed", choices=("removed", "added", "both"))
+    ap.add_argument("--guide-toward", default="target", choices=("target", "current"),
+                    help="which caption guidance pulls toward. 'current' is the RESTORE control: "
+                         "same mask, aimed back at the caption the protein already satisfies, so "
+                         "the oracle has a known right answer.")
     ap.add_argument("--dilate", type=int, default=2,
                     help="grow each aligned seed by +/- this many residues. Domains are "
                          "contiguous and the alignment is peaky; 0 selects isolated residues.")

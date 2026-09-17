@@ -54,11 +54,19 @@ PHASES=${PHASES:-VSER}
 #       let the model refill them from its prior. Four of the six swaps are REMOVALS, and removing
 #       a rare feature is something the prior does on its own -- so this arm may be sufficient, and
 #       if it is, guidance was never the mechanism.
-#   a2  the same positions, guided. The only place guidance has to justify itself.
+#   a2  the same positions, guided toward the TARGET caption. The only place guidance has to
+#       justify itself against a1.
+#   a3  the same positions, guided back toward the ORIGINAL caption. THE POSITIVE CONTROL, and the
+#       only arm here with a known right answer: the protein started with the feature, so it is
+#       reachable by construction. Mask Sho1's transmembrane helices, aim at "multi-pass membrane
+#       protein", and ask the oracle whether they come back. If they do and a1 does not restore
+#       them, guidance demonstrably installs a feature -- measured without the FILIP score. If they
+#       do not, the forward direction cannot be expected to work either, and everything reduces
+#       to a1: localised removal by prior refill.
 #   a4  random positions, same count. The floor: if a1 does not beat this, localisation bought
 #       nothing.
 #   tag the original iterative gradient selector, kept for comparison.
-ARMS=${ARMS:-a1:a2:a4}
+ARMS=${ARMS:-a1:a2:a3:a4}
 N=${N:-4}                     # replicates per swap, batched in one canvas
 ROUNDS=${ROUNDS:-12}
 K=${K:-8}                     # positions edited per round
@@ -104,6 +112,7 @@ arm_flags() {
     case "$1" in
         a1)  echo "--select filip  --gamma 0        --rounds 1" ;;
         a2)  echo "--select filip  --gamma ${GAMMA} --rounds 1" ;;
+        a3)  echo "--select filip  --gamma ${GAMMA} --rounds 1 --guide-toward current" ;;
         a4)  echo "--select random --gamma 0        --rounds 1" ;;
         tag) echo "--select tag    --gamma ${GAMMA} --rounds ${ROUNDS}" ;;
         *)   echo "--select ${SELECT} --gamma ${GAMMA} --rounds ${ROUNDS}" ;;
@@ -192,6 +201,8 @@ if has R; then
     echo "[edit] deleted phrase bought anything over masking the same number of residues at random."
     echo "[edit] a2 vs a1 is the only place guidance has to justify itself -- and four of the six"
     echo "[edit] swaps are REMOVALS, which the prior may well do unaided."
+    echo "[edit] a3 vs a1 is the POSITIVE control and the one to read first: same mask, aimed back"
+    echo "[edit] at the caption the protein already satisfied. Its oracle has a known right answer."
     echo ""
     echo "[edit] The edited sequences are in ${EDITS}. NOTHING HERE IS EVIDENCE ON ITS OWN:"
     echo "[edit] the score being reported is the score being optimised. What settles a row is its"

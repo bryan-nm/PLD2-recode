@@ -129,14 +129,24 @@ So `--select filip` masks the residues the deleted phrase points at, before any 
 the model refill them. No backward pass — cheaper than the gradient selector it replaces.
 
 ```
-a1   --select filip  --gamma 0   --rounds 1     aligned mask, unguided
-a2   --select filip  --gamma G   --rounds 1     aligned mask, guided
-a4   --select random --gamma 0   --rounds 1     the floor: same count, no information
-tag  --select tag    --gamma G   --rounds R     the original iterative gradient selector
+a1   --select filip  --gamma 0  --rounds 1                        aligned mask, unguided
+a2   --select filip  --gamma G  --rounds 1                        aligned mask, guided at the target
+a3   --select filip  --gamma G  --rounds 1 --guide-toward current aligned mask, guided BACK
+a4   --select random --gamma 0  --rounds 1                        the floor: same count, no info
+tag  --select tag    --gamma G  --rounds R                        the original gradient selector
 ```
 
-**a1 vs a4** says whether localisation bought anything. **a2 vs a1** is the only place guidance has
-to justify itself — and four of the six swaps are *removals*, which a prior may well do unaided.
+**a3 is the positive control and the one to read first.** Same mask, aimed back at the caption the
+protein already satisfied: mask Sho1's transmembrane helices, guide toward "multi-pass membrane
+protein", and ask the oracle whether they come back. It is the only arm with a *known right answer*
+— the protein started with the feature, so it is reachable by construction. If a3 restores and a1
+does not, guidance demonstrably installs a feature, measured without the FILIP score anywhere in
+the loop. If a3 fails, nothing in the forward direction can be expected to work and the method
+reduces to a1: localised removal by prior refill.
+
+**a1 vs a4** says whether localisation bought anything. **a2 vs a1** is the only place forward
+guidance has to justify itself — and four of the six swaps are *removals*, which a prior may well
+do unaided.
 
 The `hit` column reports what fraction of the residues actually unfrozen fell inside the annotated
 region, against chance. That is the arm's own premise: if `hit` sits at chance, nothing downstream
